@@ -11,7 +11,7 @@ from typing import Optional
 import chromadb
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from .models import Blueprint, Crystal, Record
+from .models import Blueprint, Crystal, Record, Sigil
 
 
 class AkashicStore:
@@ -28,6 +28,7 @@ class AkashicStore:
         self._chroma = chromadb.PersistentClient(path=str(self._dir / "chroma"))
         self._records_col = self._chroma.get_or_create_collection("records")
         self._crystals_col = self._chroma.get_or_create_collection("crystals")
+        self._sigils_col = self._chroma.get_or_create_collection("sigils")
 
     # ------------------------------------------------------------------ #
     # Blueprint                                                            #
@@ -148,10 +149,23 @@ class AkashicStore:
             }],
         )
 
-    def get_all_crystals(self, agent_id: str) -> list[Crystal]:
+    def get_all_crystals(self, agent_id: str, include_transcended: bool = False) -> list[Crystal]:
         with Session(self._engine) as session:
             stmt = select(Crystal).where(Crystal.agent_id == agent_id)
+            if not include_transcended:
+                stmt = stmt.where(Crystal.transcended == False)
             return list(session.exec(stmt).all())
+
+    def mark_crystals_transcended(self, crystal_ids: list[str]) -> None:
+        with Session(self._engine) as session:
+            for cid in crystal_ids:
+                c = session.get(Crystal, cid)
+                if c:
+                    c.transcended = True
+                    session.add(c)
+            session.commit()
+        if crystal_ids:
+            self._crystals_col.delete(ids=crystal_ids)
 
     def query_crystals_vector(
         self,
@@ -174,3 +188,62 @@ class AkashicStore:
             return list(zip(ids, distances))
         except Exception:
             return []
+
+    # ------------------------------------------------------------------ #
+    # Sigils                                                               #
+    # ------------------------------------------------------------------ #
+
+    def insert_sigil(self, sigil: Sigil) -> None:
+        with Session(self._engine) as session:
+            session.add(sigil)
+            session.commit()
+
+        # Index sigil by its name (the "door") — the glyph is too short to embed
+        self._sigils_col.add(
+            ids=[sigil.id],
+            documents=[f"{sigil.glyph} {sigil.name}"],
+            metadatas=[{
+                "agent_id": sigil.agent_id,
+                "glyph": sigil.glyph,
+                "name": sigil.name,
+                "resonance": sigil.resonance,
+                "crystal_count": sigil.crystal_count,
+                "total_records": sigil.total_records,
+                "tags": sigil.tags,
+            }],
+        )
+
+    def get_all_sigils(self, agent_id: str) -> list[Sigil]:
+        with Session(self._engine) as session:
+            stmt = select(Sigil).where(Sigil.agent_id == agent_id)
+            return list(session.exec(stmt).all())
+
+    def query_sigils_vector(
+        self,
+        agent_id: str,
+        query_text: str,
+        n_results: int = 5,
+    ) -> list[tuple[str, float]]:
+        try:
+            total = self._sigils_col.count()
+            if total == 0:
+                return []
+            n = min(n_results, total)
+            results = self._sigils_col.query(
+                query_texts=[query_text],
+                n_results=n,
+                where={"agent_id": agent_id},
+            )
+            ids = results["ids"][0]
+            distances = results["distances"][0]
+            return list(zip(ids, distances))
+        except Exception:
+            return []
+
+    def count_active_crystals(self, agent_id: str) -> int:
+        with Session(self._engine) as session:
+            stmt = select(Crystal).where(
+                Crystal.agent_id == agent_id,
+                Crystal.transcended == False,
+            )
+            return len(list(session.exec(stmt).all()))

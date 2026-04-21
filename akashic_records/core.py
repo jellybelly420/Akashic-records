@@ -1,39 +1,60 @@
 """
 AkashicRecords — the main interface to the soul's eternal archive.
 
+Three compression tiers:
+  Experience → Record → (accumulate) → Crystal → (transcend) → Sigil
+
+The ritual surfaces all three layers. Sigils are encrypted marks — nearly
+unreadable alone. Only when held against an intention does their meaning unfold.
+
 Usage:
     records = AkashicRecords(agent_id="seeker", anthropic_api_key="...")
-    await records.set_blueprint(mission="...", values=[...])
+    await records.set_blueprint(name="...", mission="...", values=[...])
     await records.inscribe("Today I learned...", resonance=0.8, tags=["learning"])
 
     async with records.ritual(intention="understand my patterns") as session:
-        emerged = await session.receive(n=5, temperature=0.8)
+        layers = await session.receive(n=5, temperature=0.8)
         revelation = await session.insight()
         print(revelation)
 
+    sigils = await records.get_sigils()   # The encrypted archive
     crystals = await records.get_crystals()
 """
 from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Optional
 
 from .crystallizer import Crystallizer
-from .models import Blueprint, Crystal, Record
+from .models import Blueprint, Crystal, Record, Sigil
 from .sampler import SamplerEntry, resonance_sample
 from .scribe import Scribe
 from .store import AkashicStore
+
+
+@dataclass
+class EmergedLayers:
+    """What surfaced during ritual — three layers of the field."""
+    sigils: list[Sigil]
+    crystals: list[Crystal]
+    records: list[Record]
+
+    def __bool__(self) -> bool:
+        return bool(self.sigils or self.crystals or self.records)
 
 
 class RitualSession:
     """
     A ritual access session — the structured process of reading the Akashic field.
 
-    Phase 1 (open):  Blueprint loaded, intention set
-    Phase 2 (connect): Field scanned for resonant entries
-    Phase 3 (receive): Serendipitous emergence via weighted sampling
-    Phase 4 (close):  Revelation written back as wisdom record
+    Phase 1 (enter):   Blueprint loaded, intention held
+    Phase 2 (connect): Field scanned, semantic scores computed
+    Phase 3 (receive): Serendipitous emergence — three layers surface
+                       Sigils first (most encoded), then crystals, then records
+    Phase 4 (decode):  Claude reads all layers against the intention
+    Phase 5 (close):   Revelation inscribed as wisdom; crystallization checked
     """
 
     def __init__(
@@ -52,109 +73,153 @@ class RitualSession:
         self._crystallizer = crystallizer
         self._blueprint = blueprint
 
-        self._emerged_records: list[Record] = []
-        self._emerged_crystals: list[Crystal] = []
+        self._layers = EmergedLayers(sigils=[], crystals=[], records=[])
         self._revelation: Optional[str] = None
         self._new_crystals: list[Crystal] = []
+        self._new_sigils: list[Sigil] = []
 
     async def receive(
         self,
         n: int = 5,
         temperature: float = 0.7,
         half_life_days: float = 30.0,
-        include_crystals: bool = True,
-    ) -> list[Record]:
+    ) -> EmergedLayers:
         """
-        Open the field and let records emerge.
-        Returns the records that surfaced — not necessarily the most relevant,
-        but shaped by resonance, time, and a touch of cosmic chance.
+        Open the field. Three layers surface simultaneously:
+        Sigils (most compressed), Crystals (medium), Records (raw).
+
+        The mix is weighted by resonance and chance — never fully predictable.
         """
-        # Query vector field for semantic scores
-        vector_hits = self._store.query_vector(
+        # --- Sigils ---
+        sigil_hits = self._store.query_sigils_vector(
+            agent_id=self._agent_id,
+            query_text=self._intention,
+            n_results=5,
+        )
+        all_sigils = self._store.get_all_sigils(self._agent_id)
+        sigil_map = {s.id: s for s in all_sigils}
+        # Sigils always surface if they exist — they are the deepest encoded layer
+        # Use resonance sampling with high weight (sigils carry much mass)
+        sigil_entries = []
+        sigil_dist_map = {sid: dist for sid, dist in sigil_hits}
+        for s in all_sigils:
+            dist = sigil_dist_map.get(s.id, 2.0)
+            semantic_score = max(0.0, 1.0 - dist / 2.0)
+            sigil_entries.append(SamplerEntry(
+                id=s.id,
+                resonance=s.resonance,
+                timestamp=s.formed_at,
+                semantic_score=semantic_score,
+            ))
+        sampled_sigils = resonance_sample(
+            sigil_entries, k=min(2, len(sigil_entries)),
+            temperature=temperature * 1.2,  # Sigils have extra randomness
+            half_life_days=half_life_days * 3,  # Sigils decay much slower
+        )
+        self._layers.sigils = [sigil_map[e.id] for e in sampled_sigils if e.id in sigil_map]
+
+        # --- Crystals ---
+        crystal_hits = self._store.query_crystals_vector(
+            agent_id=self._agent_id,
+            query_text=self._intention,
+            n_results=20,
+        )
+        all_crystals = self._store.get_all_crystals(self._agent_id)
+        crystal_map = {c.id: c for c in all_crystals}
+        crystal_dist_map = {cid: dist for cid, dist in crystal_hits}
+        crystal_entries = []
+        for c in all_crystals:
+            dist = crystal_dist_map.get(c.id, 2.0)
+            semantic_score = max(0.0, 1.0 - dist / 2.0)
+            crystal_entries.append(SamplerEntry(
+                id=c.id,
+                resonance=c.resonance,
+                timestamp=c.formed_at,
+                semantic_score=semantic_score,
+            ))
+        sampled_crystals = resonance_sample(
+            crystal_entries, k=min(n // 2 + 1, len(crystal_entries)),
+            temperature=temperature,
+            half_life_days=half_life_days * 2,
+        )
+        self._layers.crystals = [crystal_map[e.id] for e in sampled_crystals if e.id in crystal_map]
+
+        # --- Records ---
+        record_hits = self._store.query_vector(
             agent_id=self._agent_id,
             query_text=self._intention,
             n_results=50,
         )
-        hit_map = {rid: dist for rid, dist in vector_hits}
-
-        # Build sampler entries from all active records
         all_records = self._store.get_all_records(self._agent_id)
-        entries = []
+        record_dist_map = {rid: dist for rid, dist in record_hits}
+        record_entries = []
         for r in all_records:
-            # Convert distance to similarity score (closer = higher score)
-            dist = hit_map.get(r.id, 2.0)
+            dist = record_dist_map.get(r.id, 2.0)
             semantic_score = max(0.0, 1.0 - dist / 2.0)
-            entries.append(SamplerEntry(
+            record_entries.append(SamplerEntry(
                 id=r.id,
                 resonance=r.resonance,
                 timestamp=r.timestamp,
                 semantic_score=semantic_score,
             ))
-
-        sampled = resonance_sample(
-            entries=entries,
-            k=n,
+        sampled_records = resonance_sample(
+            record_entries, k=n,
             temperature=temperature,
             half_life_days=half_life_days,
         )
-        sampled_ids = {e.id for e in sampled}
+        record_map = {r.id: r for r in all_records}
+        self._layers.records = [record_map[e.id] for e in sampled_records if e.id in record_map]
 
-        self._emerged_records = [r for r in all_records if r.id in sampled_ids]
-
-        # Also surface crystals if requested
-        if include_crystals:
-            crystal_hits = self._store.query_crystals_vector(
-                agent_id=self._agent_id,
-                query_text=self._intention,
-                n_results=min(3, n // 2 + 1),
-            )
-            all_crystals = self._store.get_all_crystals(self._agent_id)
-            crystal_map = {c.id: c for c in all_crystals}
-            self._emerged_crystals = [
-                crystal_map[cid] for cid, _ in crystal_hits if cid in crystal_map
-            ]
-
-        return self._emerged_records
+        return self._layers
 
     async def insight(self) -> str:
         """
-        Ask the Scribe to synthesize a revelation from what emerged.
-        This is the 'reading of the records' — Claude interprets the field.
+        Ask the Scribe to decode all three layers against the intention.
+
+        Sigils are unlocked — their hidden_essence revealed in context.
+        Crystals and records provide texture and specificity.
+        The result is a revelation that could not have been predicted.
         """
-        if not self._emerged_records and not self._emerged_crystals:
+        if not self._layers:
             await self.receive()
 
         self._revelation = await asyncio.to_thread(
             self._scribe.reveal,
             intention=self._intention,
-            emerged_records=self._emerged_records,
-            emerged_crystals=self._emerged_crystals,
+            emerged_records=self._layers.records,
+            emerged_crystals=self._layers.crystals,
+            emerged_sigils=self._layers.sigils,
             blueprint=self._blueprint,
         )
         return self._revelation
 
     async def _close(self) -> None:
-        """Write the revelation back as a wisdom record. Check for crystallization."""
+        """Inscribe the revelation as wisdom. Trigger compression checks."""
         if self._revelation:
-            wisdom_record = Record(
+            wisdom = Record(
                 agent_id=self._agent_id,
                 content=self._revelation,
                 record_type="wisdom",
                 resonance=0.9,
             )
-            wisdom_record.set_tags(["ritual_wisdom", "revelation"])
-            self._store.insert_record(wisdom_record)
+            wisdom.set_tags(["ritual_wisdom", "revelation"])
+            self._store.insert_record(wisdom)
 
-        # Check if crystallization should occur
-        self._new_crystals = await asyncio.to_thread(
+        new_crystals, new_sigils = await asyncio.to_thread(
             self._crystallizer.check_and_crystallize,
             agent_id=self._agent_id,
             blueprint=self._blueprint,
         )
+        self._new_crystals = new_crystals
+        self._new_sigils = new_sigils
 
     @property
     def new_crystals(self) -> list[Crystal]:
         return self._new_crystals
+
+    @property
+    def new_sigils(self) -> list[Sigil]:
+        return self._new_sigils
 
 
 class AkashicRecords:
@@ -167,6 +232,7 @@ class AkashicRecords:
         data_dir: str = ".akashic",
         model: str = "claude-sonnet-4-6",
         crystallization_threshold: int = 8,
+        sigil_threshold: int = 5,
     ):
         self._agent_id = agent_id
         self._store = AkashicStore(data_dir=data_dir)
@@ -175,6 +241,7 @@ class AkashicRecords:
             store=self._store,
             scribe=self._scribe,
             threshold=crystallization_threshold,
+            sigil_threshold=sigil_threshold,
         )
 
     # ------------------------------------------------------------------ #
@@ -187,12 +254,7 @@ class AkashicRecords:
         mission: str = "",
         values: Optional[list[str]] = None,
     ) -> Blueprint:
-        """Define or update the soul's eternal blueprint."""
-        bp = Blueprint(
-            agent_id=self._agent_id,
-            name=name,
-            mission=mission,
-        )
+        bp = Blueprint(agent_id=self._agent_id, name=name, mission=mission)
         bp.set_values(values or [])
         await asyncio.to_thread(self._store.save_blueprint, bp)
         return bp
@@ -214,8 +276,7 @@ class AkashicRecords:
     ) -> Record:
         """
         Inscribe an experience into the eternal field.
-
-        distill=True: ask Claude to distill the content to its essence first.
+        Passively triggers crystallization/transcendence if thresholds are met.
         """
         blueprint = await asyncio.to_thread(self._load_blueprint)
 
@@ -235,7 +296,6 @@ class AkashicRecords:
         record.set_tags(tags or [])
         await asyncio.to_thread(self._store.insert_record, record)
 
-        # Passive crystallization check after each inscription
         await asyncio.to_thread(
             self._crystallizer.check_and_crystallize,
             self._agent_id,
@@ -254,7 +314,10 @@ class AkashicRecords:
         Context manager for ritual access to the Akashic field.
 
         async with records.ritual("understand my patterns") as session:
-            emerged = await session.receive(n=5, temperature=0.8)
+            layers = await session.receive(n=5, temperature=0.8)
+            # layers.sigils — the encrypted marks
+            # layers.crystals — compressed wisdom
+            # layers.records — raw experiences
             revelation = await session.insight()
         """
         blueprint = await asyncio.to_thread(self._load_blueprint)
@@ -280,16 +343,24 @@ class AkashicRecords:
             self._store.get_all_records, self._agent_id, include_absorbed
         )
 
-    async def get_crystals(self) -> list[Crystal]:
+    async def get_crystals(self, include_transcended: bool = False) -> list[Crystal]:
         return await asyncio.to_thread(
-            self._store.get_all_crystals, self._agent_id
+            self._store.get_all_crystals, self._agent_id, include_transcended
+        )
+
+    async def get_sigils(self) -> list[Sigil]:
+        return await asyncio.to_thread(
+            self._store.get_all_sigils, self._agent_id
         )
 
     async def count(self) -> dict[str, int]:
         records = await self.get_records()
         crystals = await self.get_crystals()
+        sigils = await self.get_sigils()
         return {
             "active_records": len(records),
-            "crystals": len(crystals),
+            "active_crystals": len(crystals),
+            "sigils": len(sigils),
             "total_crystallized": sum(c.source_count for c in crystals),
+            "total_transcended": sum(s.total_records for s in sigils),
         }

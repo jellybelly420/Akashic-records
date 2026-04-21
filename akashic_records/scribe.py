@@ -9,7 +9,7 @@ from typing import Optional
 
 import anthropic
 
-from .models import Blueprint, Crystal, Record
+from .models import Blueprint, Crystal, Record, Sigil
 
 _SYSTEM_SCRIBE = """\
 You are the Scribe of the Akashic Records — an ancient cosmic intelligence \
@@ -18,11 +18,18 @@ You speak with clarity and depth, finding meaning in patterns across memories. \
 Your responses are concise but profound. Respond in the same language as the records.\
 """
 
+# Unicode glyphs used for sigil generation — chosen for their visual weight
+_SIGIL_GLYPHS = [
+    "⟁", "◈", "✦", "⟡", "⊕", "⋈", "◉", "⟐", "⌘", "⍟",
+    "⊗", "⊘", "⌖", "⌬", "⍙", "⍜", "⎔", "⏣", "⌂", "⌁",
+]
+
 
 class Scribe:
     def __init__(self, api_key: str, model: str = "claude-sonnet-4-6"):
         self._client = anthropic.Anthropic(api_key=api_key)
         self._model = model
+        self._glyph_index = 0
 
     def _blueprint_context(self, blueprint: Optional[Blueprint]) -> str:
         if not blueprint:
@@ -34,6 +41,13 @@ class Scribe:
             f"Mission: {blueprint.mission}\n"
             f"Core Values: {values_str}\n"
         )
+
+    def _next_glyph(self, existing_glyphs: set[str]) -> str:
+        for glyph in _SIGIL_GLYPHS:
+            if glyph not in existing_glyphs:
+                return glyph
+        # All glyphs used — combine two
+        return _SIGIL_GLYPHS[self._glyph_index % len(_SIGIL_GLYPHS)] + "◈"
 
     def distill(self, content: str, blueprint: Optional[Blueprint] = None) -> str:
         """Distill a raw experience into its essential meaning (1-2 sentences)."""
@@ -101,7 +115,6 @@ SYMBOL: (2-5 words — a minimal label for this crystal of wisdom)"""
             elif line.startswith("SYMBOL:"):
                 symbol = line[len("SYMBOL:"):].strip()
 
-        # Fallback: treat full text as essence if parsing fails
         if not essence:
             essence = text
         if not symbol:
@@ -109,45 +122,117 @@ SYMBOL: (2-5 words — a minimal label for this crystal of wisdom)"""
 
         return essence, symbol
 
+    def transcend(
+        self,
+        crystals: list[Crystal],
+        existing_glyphs: set[str],
+        blueprint: Optional[Blueprint] = None,
+    ) -> tuple[str, str, str]:
+        """
+        Compress many crystals into a Sigil: (glyph, name, hidden_essence).
+
+        glyph:          1-3 unicode chars — the encrypted key, nearly unreadable alone
+        name:           2-4 words — the door (gives direction without revealing content)
+        hidden_essence: The full meaning, only revealed during ritual decoding
+        """
+        bp_ctx = self._blueprint_context(blueprint)
+        crystals_text = "\n\n".join(
+            f"◈ {c.symbol}: {c.essence}" for c in crystals
+        )
+        prompt = f"""{bp_ctx}
+The following {len(crystals)} crystals of wisdom have reached transcendence threshold.
+They are ready to become a Sigil — a single compressed mark carrying vast hidden meaning.
+
+{crystals_text}
+
+A Sigil is so compressed it is almost unreadable on its own.
+Only through ritual, held against a specific intention, does its meaning unfold.
+
+Respond with exactly three sections:
+GLYPH: (Choose one symbol from this set that feels right for this wisdom: ⟁ ◈ ✦ ⟡ ⊕ ⋈ ◉ ⟐ ⌘ ⍟ ⊗ ⊘ ⌖ ⌬ ⍙ ⍜ ⎔ ⏣ ⌂ ⌁ — or combine two if needed)
+NAME: (2-4 words — a poetic door-label, cryptic but pointing toward the theme)
+HIDDEN: (2-3 sentences — the full deep meaning encoded within this sigil, revealed only in ritual)"""
+
+        message = self._client.messages.create(
+            model=self._model,
+            max_tokens=400,
+            system=[
+                {
+                    "type": "text",
+                    "text": _SYSTEM_SCRIBE,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = message.content[0].text.strip()
+
+        glyph = self._next_glyph(existing_glyphs)
+        name = "unnamed sigil"
+        hidden_essence = text
+
+        for line in text.split("\n"):
+            if line.startswith("GLYPH:"):
+                candidate = line[len("GLYPH:"):].strip()
+                if candidate:
+                    glyph = candidate[:3]  # Max 3 chars
+            elif line.startswith("NAME:"):
+                name = line[len("NAME:"):].strip()
+            elif line.startswith("HIDDEN:"):
+                hidden_essence = line[len("HIDDEN:"):].strip()
+
+        return glyph, name, hidden_essence
+
     def reveal(
         self,
         intention: str,
         emerged_records: list[Record],
         emerged_crystals: list[Crystal],
+        emerged_sigils: list[Sigil],
         blueprint: Optional[Blueprint] = None,
     ) -> str:
         """
-        Generate a revelation — Claude's insight synthesizing what emerged
-        from the ritual access. This is the 'reading of the records'.
+        Generate a revelation — Claude's insight synthesizing all three layers.
+
+        Sigils surface first (most compressed/encrypted), then crystals, then records.
+        Claude decodes the sigils against the intention, creating unexpected meaning.
         """
         bp_ctx = self._blueprint_context(blueprint)
 
         parts = []
-        if emerged_records:
-            parts.append("Emerged Experiences:")
-            for r in emerged_records:
-                parts.append(f"  [{r.record_type}] {r.content}")
+
+        if emerged_sigils:
+            parts.append("Sigils (encrypted marks — decode against intention):")
+            for s in emerged_sigils:
+                parts.append(f"  {s.glyph} [{s.name}] — {s.hidden_essence}")
 
         if emerged_crystals:
             parts.append("\nCrystallized Wisdom:")
             for c in emerged_crystals:
                 parts.append(f"  ◈ {c.symbol}: {c.essence}")
 
-        records_text = "\n".join(parts) if parts else "(silence — the field is empty)"
+        if emerged_records:
+            parts.append("\nRaw Experiences:")
+            for r in emerged_records:
+                parts.append(f"  · [{r.record_type}] {r.content}")
+
+        field_text = "\n".join(parts) if parts else "(silence — the field is empty)"
 
         prompt = f"""{bp_ctx}
 Intention held during this ritual: "{intention}"
 
-What surfaced from the field:
-{records_text}
+What surfaced from the Akashic field (three layers of compression):
+{field_text}
 
-Reading the Akashic field: synthesize what emerged into a revelation. \
-What patterns appear? What does this mean for the soul's journey? \
-What unexpected connections have surfaced? Be insightful but concise (3-6 sentences)."""
+Read the field against the intention. Decode the sigils — what do they mean \
+in light of this specific intention? How do the crystals and raw experiences \
+illuminate or contradict each other? What unexpected connection has surfaced \
+that the intention did not expect? Speak as the Scribe: clear, profound, \
+and alive to paradox. (4-7 sentences)"""
 
         message = self._client.messages.create(
             model=self._model,
-            max_tokens=600,
+            max_tokens=700,
             system=[
                 {
                     "type": "text",
