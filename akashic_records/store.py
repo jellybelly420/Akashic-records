@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 import chromadb
+from sqlalchemy.orm import sessionmaker
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from .models import Blueprint, Crystal, Record, Sigil
@@ -21,7 +22,14 @@ class AkashicStore:
 
         # SQLite — structural plane
         db_path = self._dir / "records.db"
-        self._engine = create_engine(f"sqlite:///{db_path}")
+        self._engine = create_engine(
+            f"sqlite:///{db_path}",
+            connect_args={"check_same_thread": False},
+        )
+        # expire_on_commit=False keeps attribute values accessible after session closes
+        self._Session = sessionmaker(
+            bind=self._engine, class_=Session, expire_on_commit=False
+        )
         SQLModel.metadata.create_all(self._engine)
 
         # ChromaDB — etheric (vector) plane
@@ -35,7 +43,7 @@ class AkashicStore:
     # ------------------------------------------------------------------ #
 
     def save_blueprint(self, bp: Blueprint) -> None:
-        with Session(self._engine) as session:
+        with self._Session() as session:
             existing = session.get(Blueprint, bp.agent_id)
             if existing:
                 existing.name = bp.name
@@ -47,7 +55,7 @@ class AkashicStore:
             session.commit()
 
     def load_blueprint(self, agent_id: str) -> Optional[Blueprint]:
-        with Session(self._engine) as session:
+        with self._Session() as session:
             return session.get(Blueprint, agent_id)
 
     # ------------------------------------------------------------------ #
@@ -55,7 +63,7 @@ class AkashicStore:
     # ------------------------------------------------------------------ #
 
     def insert_record(self, record: Record) -> None:
-        with Session(self._engine) as session:
+        with self._Session() as session:
             session.add(record)
             session.commit()
 
@@ -74,18 +82,18 @@ class AkashicStore:
         )
 
     def get_all_records(self, agent_id: str, include_absorbed: bool = False) -> list[Record]:
-        with Session(self._engine) as session:
+        with self._Session() as session:
             stmt = select(Record).where(Record.agent_id == agent_id)
             if not include_absorbed:
                 stmt = stmt.where(Record.absorbed == False)
             return list(session.exec(stmt).all())
 
     def get_record(self, record_id: str) -> Optional[Record]:
-        with Session(self._engine) as session:
+        with self._Session() as session:
             return session.get(Record, record_id)
 
     def mark_absorbed(self, record_ids: list[str]) -> None:
-        with Session(self._engine) as session:
+        with self._Session() as session:
             for rid in record_ids:
                 r = session.get(Record, rid)
                 if r:
@@ -121,7 +129,7 @@ class AkashicStore:
             return []
 
     def count_active_records(self, agent_id: str) -> int:
-        with Session(self._engine) as session:
+        with self._Session() as session:
             stmt = select(Record).where(
                 Record.agent_id == agent_id,
                 Record.absorbed == False,
@@ -133,7 +141,7 @@ class AkashicStore:
     # ------------------------------------------------------------------ #
 
     def insert_crystal(self, crystal: Crystal) -> None:
-        with Session(self._engine) as session:
+        with self._Session() as session:
             session.add(crystal)
             session.commit()
 
@@ -150,14 +158,14 @@ class AkashicStore:
         )
 
     def get_all_crystals(self, agent_id: str, include_transcended: bool = False) -> list[Crystal]:
-        with Session(self._engine) as session:
+        with self._Session() as session:
             stmt = select(Crystal).where(Crystal.agent_id == agent_id)
             if not include_transcended:
                 stmt = stmt.where(Crystal.transcended == False)
             return list(session.exec(stmt).all())
 
     def mark_crystals_transcended(self, crystal_ids: list[str]) -> None:
-        with Session(self._engine) as session:
+        with self._Session() as session:
             for cid in crystal_ids:
                 c = session.get(Crystal, cid)
                 if c:
@@ -194,7 +202,7 @@ class AkashicStore:
     # ------------------------------------------------------------------ #
 
     def insert_sigil(self, sigil: Sigil) -> None:
-        with Session(self._engine) as session:
+        with self._Session() as session:
             session.add(sigil)
             session.commit()
 
@@ -214,7 +222,7 @@ class AkashicStore:
         )
 
     def get_all_sigils(self, agent_id: str) -> list[Sigil]:
-        with Session(self._engine) as session:
+        with self._Session() as session:
             stmt = select(Sigil).where(Sigil.agent_id == agent_id)
             return list(session.exec(stmt).all())
 
@@ -241,7 +249,7 @@ class AkashicStore:
             return []
 
     def count_active_crystals(self, agent_id: str) -> int:
-        with Session(self._engine) as session:
+        with self._Session() as session:
             stmt = select(Crystal).where(
                 Crystal.agent_id == agent_id,
                 Crystal.transcended == False,
